@@ -3,11 +3,12 @@
 
 import numpy as np
 
+import matplotlib.image as mimage
+
 from astropy import units as u
 from astropy.coordinates import SkyCoord
 
-from qtpy.QtWidgets import (QLabel, QAction, QActionGroup,
-                            QDialog, QHBoxLayout, QVBoxLayout)
+from qtpy.QtWidgets import (QLabel, QMessageBox)
 
 from glue.core.message import SettingsChangeMessage
 
@@ -21,25 +22,124 @@ from glue.viewers.common.qt.tool import Tool
 
 from .utils.contour import ContourSettings
 
+CONTOUR_DEFAULT_NUMBER_OF_LEVELSS = 8
+CONTOUR_MAX_NUMBER_OF_LEVELS = 1000
 
 __all__ = ['CubevizImageViewer']
 
+
+def only_draw_axes_images(ax):
+    """
+    This function is a modified version of
+    matplotlib.axes._base._AxesBase.draw
+    This version only updates the images
+    of the axes.
+    :param ax: axes with images to update
+    """
+    if not ax.get_visible():
+        return
+
+    renderer = ax._cachedRenderer
+    renderer.open_group('axes')
+
+    # prevent triggering call backs during the draw process
+    ax._stale = True
+
+    locator = ax.get_axes_locator()
+    if locator:
+        pos = locator(ax, renderer)
+        ax.apply_aspect(pos)
+    else:
+        ax.apply_aspect()
+
+    # This is the biggest modification
+    # Restrict the artists list to images
+    artists = ax.images
+    artists = sorted(artists, key=lambda x: x.zorder)
+
+    # rasterize artists with negative zorder
+    # if the minimum zorder is negative, start rasterization
+    rasterization_zorder = ax._rasterization_zorder
+    if (rasterization_zorder is not None and
+            artists and artists[0].zorder < rasterization_zorder):
+        renderer.start_rasterizing()
+        artists_rasterized = [a for a in artists
+                              if a.zorder < rasterization_zorder]
+        artists = [a for a in artists
+                   if a.zorder >= rasterization_zorder]
+    else:
+        artists_rasterized = []
+
+    if artists_rasterized:
+        for a in artists_rasterized:
+            a.draw(renderer)
+        renderer.stop_rasterizing()
+
+    # This function will draw the images in the artist list
+    mimage._draw_list_compositing_images(renderer, ax, artists)
+
+    if hasattr(ax, "coords"):
+        ax.coords.frame.draw(renderer)
+
+    renderer.close_group('axes')
+    ax._cachedRenderer = renderer
+    ax.stale = False
 
 class CubevizImageLayerState(ImageLayerState):
     """
     Sub-class of ImageLayerState that includes the ability to include smoothing
     on-the-fly.
     """
-
     preview_function = None
+    slice_index_override = None
 
     def get_sliced_data(self, view=None):
-        if self.preview_function is None:
-            return super(CubevizImageLayerState, self).get_sliced_data(view=view)
+        """
+        Override and modify ImageLayerState.get_sliced_data.
+        Modifications:
+            1)  If CubevizImageLayerState.preview_function is
+                defined, apply the function to data before return.
+            2)  If CubevizImageLayerState.slice_index_override is
+                defined, change slice index to that value
+        :param view: image view
+        :return: 2D np.ndarray
+        """
+        slices, agg_func, transpose = self.viewer_state.numpy_slice_aggregation_transpose
+        full_view = slices
+        if self.slice_index_override is not None:
+            full_view[0] = self.slice_index_override
+        if view is not None and len(view) == 2:
+            x_axis = self.viewer_state.x_att.axis
+            y_axis = self.viewer_state.y_att.axis
+            full_view[x_axis] = view[1]
+            full_view[y_axis] = view[0]
+            view_applied = True
         else:
-            data = super(CubevizImageLayerState, self).get_sliced_data()
-            return self.preview_function(data)
+            view_applied = False
+        image = self._get_image(view=full_view)
 
+        # Apply aggregation functions if needed
+        if image.ndim != len(agg_func):
+            raise ValueError("Sliced image dimensions ({0}) does not match "
+                             "aggregation function list ({1})"
+                             .format(image.ndim, len(agg_func)))
+        for axis in range(image.ndim - 1, -1, -1):
+            func = agg_func[axis]
+            if func is not None:
+                image = func(image, axis=axis)
+        if image.ndim != 2:
+            raise ValueError("Image after aggregation should have two dimensions")
+        if transpose:
+            image = image.transpose()
+        if view_applied or view is None or self.preview_function is not None:
+            data = image
+        else:
+            data = image[view]
+
+        if self.preview_function is not None:
+            return self.preview_function(data)
+        else:
+            return data
 
 class CubevizImageLayerArtist(ImageLayerArtist):
 
@@ -58,6 +158,8 @@ class CubevizImageViewer(ImageViewer):
         self. _layer_style_widget_cls[CubevizImageLayerArtist] = ImageLayerStyleEditor
         self._synced_checkbox = None
         self._slice_index = None
+
+        self.component_unit_label = ""  # String to hold units of data values
 
         self.is_mouse_over = False  # If mouse cursor is over viewer
         self.hold_coords = False  # Switch to hold current displayed coords
@@ -83,9 +185,13 @@ class CubevizImageViewer(ImageViewer):
         self.statusBar().addPermanentWidget(self.coord_label)
 
         # Connect matplotlib events to event handlers
+        self.statusBar().messageChanged.connect(self.message_changed_callback)
         self.figure.canvas.mpl_connect('motion_notify_event', self.mouse_move)
         #self.figure.canvas.mpl_connect('axes_leave_event', self.mouse_exited)
         self.figure.canvas.mpl_connect('figure_enter_event', self.turn_mouse_on)
+
+        self._dont_update_status = False  # Don't save statusBar message when coords are changing
+        self.status_message = self.statusBar().currentMessage()
 
     def get_data_layer_artist(self, layer=None, layer_state=None):
         if layer.ndim == 1:
@@ -104,7 +210,10 @@ class CubevizImageViewer(ImageViewer):
         :param title: str: Plot title
         """
         if title is not None:
-            self.axes_title = title
+            if self.component_unit_label:
+                self.axes_title = "{0} [{1}]".format(title, self.component_unit_label)
+            else:
+                self.axes_title = title
 
         if self.is_contour_preview_active:
             return
@@ -215,7 +324,7 @@ class CubevizImageViewer(ImageViewer):
             arr = data[self.contour_component][self.slice_index]
         return arr
 
-    def draw_contour(self):
+    def draw_contour(self, draw=True):
         self._delete_contour()
 
         if self.is_contour_preview_active:
@@ -236,25 +345,39 @@ class CubevizImageViewer(ImageViewer):
         if settings.spacing is None:
             spacing = 1
             if vmax != vmin:
-                spacing = (vmax-vmin)/6
+                spacing = (vmax-vmin)/CONTOUR_DEFAULT_NUMBER_OF_LEVELSS
         else:
             spacing = settings.spacing
 
         levels = np.arange(vmin, vmax, spacing)
         levels = np.append(levels, vmax)
 
+        if levels.size > CONTOUR_MAX_NUMBER_OF_LEVELS:
+            message = "The current contour spacing is too small and " \
+                      "results in too many levels. Contour spacing " \
+                      "settings have been reset to auto."
+            info = QMessageBox.critical(self, "Error", message)
+
+            settings.spacing = None
+            settings.data_spacing = spacing
+            if settings.dialog is not None:
+                settings.dialog.custom_spacing_checkBox.setChecked(False)
+            spacing = (vmax - vmin)/CONTOUR_DEFAULT_NUMBER_OF_LEVELSS
+            levels = np.arange(vmin, vmax, spacing)
+            levels = np.append(levels, vmax)
+
         self.contour = self.axes.contour(arr, levels=levels, **settings.options)
 
         if settings.add_contour_label:
             self.axes.clabel(self.contour, fontsize=settings.font_size)
 
+        settings.data_max = arr.max()
+        settings.data_min = arr.min()
+        settings.data_spacing = spacing
         if settings.dialog is not None:
-            settings.data_max = arr.max()
-            settings.data_min = arr.min()
-            settings.data_spacing = spacing
             settings.update_dialog()
-
-        self.axes.figure.canvas.draw()
+        if draw:
+            self.axes.figure.canvas.draw()
 
     def default_contour(self, *args):
         """
@@ -272,21 +395,15 @@ class CubevizImageViewer(ImageViewer):
         change the `contour_component` class var
         :param args: arguments from toolbar
         """
-        self.is_contour_active = True
+
         components = self.cubeviz_layout.component_labels
         self.contour_component = pick_item(components, components,
                                            title='Custom Contour',
                                            label='Pick a component')
         if self.contour_component is None:
-            # Edit toolbar menu to check the off option
-            menu = self.toolbar.actions['cubeviz:contour'].menu()
-            actions = menu.actions()
-            for action in actions:
-                if 'Off' == action.text():
-                    action.setChecked(True)
-                    break
-            self.remove_contour()
+            return
         else:
+            self.is_contour_active = True
             self.draw_contour()
 
     def remove_contour(self, *args):
@@ -309,7 +426,7 @@ class CubevizImageViewer(ImageViewer):
         vmin = arr.min()
         spacing = 1
         if vmax != vmin:
-            spacing = (vmax - vmin) / 6
+            spacing = (vmax - vmin)/CONTOUR_DEFAULT_NUMBER_OF_LEVELSS
         self.contour_settings.data_max = vmax
         self.contour_settings.data_min = vmin
         self.contour_settings.data_spacing = spacing
@@ -347,11 +464,63 @@ class CubevizImageViewer(ImageViewer):
         self._synced_checkbox.stateChanged.connect(self._synced_checkbox_callback)
 
     def update_slice_index(self, index):
+        """
+        Function to update image and slice index.
+        Redraws figure.
+        :param index: (int) slice index
+        """
+        # Reset slice index override
+        for layer in self.layers:
+            if isinstance(layer, CubevizImageLayerArtist):
+                layer.state.slice_index_override = None
+
         self._slice_index = index
         z, y, x = self.state.slices
         self.state.slices = (self._slice_index, y, x)
         if self.is_contour_active:
             self.draw_contour()
+
+    def fast_draw_slice_at_index(self, index):
+        """
+        Function to update the displayed image at a slice index
+        quickly. Used when the user is scrolling using a slider.
+        Utilizes a modified version of matplotlib's `axes.draw()`
+        function to only draw images then uses `fig.canvas.blit()`
+        to update the canvas.
+        :param index: (int) slice index
+        """
+        # draw_artist can only be used after an
+        # initial draw which caches the render
+        if self.axes._cachedRenderer is None:
+            self.update_slice_index(index)
+            return
+
+        self._slice_index = index
+
+        # Set main image's slice index to index
+        for layer in self.layers:
+            if isinstance(layer, CubevizImageLayerArtist):
+                layer.state.slice_index_override = index
+        # Invalidate cached data for image viewer
+        # Or else it will not be redrawn
+        self.axes._composite_image.invalidate_cache()
+
+        # Redraw canvas images
+        fig = self.axes.figure
+        for ax in fig.axes:
+            only_draw_axes_images(ax)
+
+        # Draw contour and its labels
+        ax = self.axes
+        if self.is_contour_active and self.contour is not None:
+            self.draw_contour(draw=False)
+            for c in self.contour.collections:
+                ax.draw_artist(c)
+            for t in self.contour.labelTexts:
+                ax.draw_artist(t)
+
+        # update canvas using blit
+        fig.canvas.blit()
 
     @property
     def synced(self):
@@ -364,6 +533,19 @@ class CubevizImageViewer(ImageViewer):
     @property
     def slice_index(self):
         return self._slice_index
+
+    def update_component_unit_label(self, component_label):
+        """
+        Update component's unit label.
+        :param component_label: component id as a string
+        """
+        data = self.state.layers_data[0]
+        unit = str(data.get_component(component_label).units)
+        if unit:
+            self.component_unit_label = "{0}".format(unit)
+        else:
+            self.component_unit_label = ""
+        return self.component_unit_label
 
     def get_coords(self):
         """
@@ -395,6 +577,20 @@ class CubevizImageViewer(ImageViewer):
             self._coords_in_degrees = True
             self._coords_format_function = self._format_to_degree_string
 
+    def message_changed_callback(self, event):
+        """
+        This will be used to swap tool messages and coords messages.
+        When coords are displayed, tool message is cleared.
+        So we save the tool message and update it when it changes.
+        This callback is for when the tool message changes and the
+        boolean associated is to ignore the tool messages from the
+        coordinate display.
+        :param event: str: New status bar message.
+        """
+        if self._dont_update_status:
+            return
+        self.status_message = event
+
     def clear_coords(self):
         """
         Reset coord display and mouse tracking variables.
@@ -406,6 +602,7 @@ class CubevizImageViewer(ImageViewer):
         self.x_mouse = None
         self.y_mouse = None
         self.coord_label.setText('')
+        self.statusBar().showMessage(self.status_message)
 
     def _format_to_degree_string(self, ra, dec):
         """
@@ -497,9 +694,12 @@ class CubevizImageViewer(ImageViewer):
                             string = string + " " + self._coords_format_function(ra, dec)
                 # Pixel Value:
                 v = arr[y][x]
-                string = "{:1.4f} ".format(v) + string
+                string = "{0:1.4f} {1} ".format(v, self.component_unit_label) + string
         # Add a gap to string and add to viewer.
         string += " "
+        self._dont_update_status = True
+        self.statusBar().clearMessage()
+        self._dont_update_status = False
         self.coord_label.setText(string)
         return
 
