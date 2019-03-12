@@ -65,7 +65,7 @@ import pytest
 from .tests.helpers import (toggle_viewer, select_viewer, create_glue_app,
                             reset_app_state)
 
-@pytest.fixture(scope='session')
+@pytest.fixture(scope='module')
 def cubeviz_layout():
     app = create_glue_app()
     layout = app.tab(0)
@@ -74,7 +74,10 @@ def cubeviz_layout():
     if sys.platform.startswith('win'):
         layout._cubeviz_toolbar._toggle_sidebar()
 
-    return app.tab(0)
+    yield layout
+
+    app.close()
+
 
 @pytest.fixture(autouse=True)
 def reset_state(qtbot, cubeviz_layout):
